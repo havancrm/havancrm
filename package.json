@@ -1,0 +1,12 @@
+{
+  "name": "havancrm",
+  "version": "1.0.0",
+  "description": "แอปมือถือช่วยเซลล์ขาย: ข้อมูลลูกค้า ออเดอร์ ยอดขาย ทำงานออฟไลน์ + ซิงค์ + สำรองข้อมูล",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=18" }
+}
