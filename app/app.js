@@ -1,5 +1,5 @@
 import * as db from './db.js';
-import { sync, scheduleSync, startAutoSync, onSync, syncState, getConfig, pendingCount } from './sync.js';
+import { sync, scheduleSync, startAutoSync, onSync, syncState, getConfig, pendingCount, callServer } from './sync.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const main = $('#main');
@@ -321,10 +321,10 @@ function settings() {
   return `
   <h1>ตั้งค่า & สำรองข้อมูล</h1>
   <section class="card">
-    <h2>ซิงค์ข้อมูลกับเซิร์ฟเวอร์</h2>
-    <p class="hint">ข้อมูลทั้งหมดเก็บในเครื่องก่อน (ใช้งานออฟไลน์ได้) แล้วซิงค์อัตโนมัติเมื่อมีอินเทอร์เน็ต ทุกเครื่องที่ใช้เซิร์ฟเวอร์และรหัสเดียวกันจะเห็นข้อมูลเดียวกัน</p>
+    <h2>เชื่อมต่อฐานข้อมูล</h2>
+    <p class="hint">ใส่ URL ของ Google Sheet (Apps Script ที่ลงท้ายด้วย <code>/exec</code>) หรือที่อยู่เซิร์ฟเวอร์ HavanCRM ข้อมูลเก็บในเครื่องก่อน (ใช้งานออฟไลน์ได้) แล้วซิงค์อัตโนมัติ ทุกเครื่องที่ใช้ URL และรหัสเดียวกันจะเห็นข้อมูลเดียวกัน</p>
     <form class="form" data-init="settings-form">
-      ${field('url', 'ที่อยู่เซิร์ฟเวอร์', '', 'type="url" placeholder="https://your-server.example.com" inputmode="url"')}
+      ${field('url', 'URL ฐานข้อมูล', '', 'type="url" placeholder="https://script.google.com/macros/s/…/exec" inputmode="url"')}
       ${field('token', 'รหัสซิงค์ (SYNC_TOKEN)', '', 'type="password" autocomplete="off"')}
       <button class="btn primary wide">บันทึก & ซิงค์ตอนนี้</button>
     </form>
@@ -335,7 +335,7 @@ function settings() {
     <p class="hint">ดาวน์โหลดไฟล์สำรอง (.json) เก็บไว้ใน Google Drive / LINE Keep หรือเครื่องอื่น และนำเข้าเพื่อกู้คืนได้ทุกเมื่อ ข้อมูลเดิมจะไม่ถูกลบ (ใช้ข้อมูลที่ใหม่กว่า)</p>
     <button class="btn wide" data-export>⬇ ดาวน์โหลดไฟล์สำรอง</button>
     <label class="btn wide file">⬆ นำเข้าไฟล์สำรอง<input type="file" accept="application/json,.json" data-import hidden></label>
-    <button class="btn ghost wide" data-server-backup>สั่งสำรองข้อมูลบนเซิร์ฟเวอร์</button>
+    <button class="btn ghost wide" data-server-backup>สำรองข้อมูลบน Google Drive / เซิร์ฟเวอร์ตอนนี้</button>
   </section>
   <section class="card">
     <h2>ข้อมูลในเครื่อง</h2>
@@ -347,7 +347,7 @@ function settings() {
 function syncText(st) {
   const last = st.lastSyncAt ? new Date(st.lastSyncAt).toLocaleString('th-TH') : 'ยังไม่เคย';
   return {
-    off: 'ยังไม่ได้ตั้งค่าเซิร์ฟเวอร์ — ข้อมูลเก็บในเครื่องนี้เท่านั้น',
+    off: 'ยังไม่ได้เชื่อมต่อฐานข้อมูล — ข้อมูลเก็บในเครื่องนี้เท่านั้น',
     offline: `ออฟไลน์ — จะซิงค์เมื่อมีอินเทอร์เน็ต (ซิงค์ล่าสุด ${last})`,
     syncing: 'กำลังซิงค์…',
     ok: `ซิงค์สำเร็จ ${last}`,
@@ -406,7 +406,7 @@ function bindView(r) {
 
   if (init === 'settings-form') {
     const form = main.querySelector('form');
-    getConfig().then(({ url, token }) => { form.url.value = url || location.origin; form.token.value = token; });
+    getConfig().then(({ url, token }) => { form.url.value = url; form.token.value = token; });
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       await db.setMeta('serverUrl', form.url.value.trim());
@@ -491,13 +491,11 @@ async function onSettingsClick(e) {
     await db.setMeta('lastExportAt', Date.now());
   }
   if (e.target.matches('[data-server-backup]')) {
-    const { url, token } = await getConfig();
-    if (!url) return toast('ยังไม่ได้ตั้งค่าเซิร์ฟเวอร์');
     try {
       await sync();
-      const res = await fetch(url.replace(/\/+$/, '') + '/api/backup', { method: 'POST', headers: token ? { authorization: `Bearer ${token}` } : {} });
-      toast(res.ok ? 'สำรองข้อมูลบนเซิร์ฟเวอร์แล้ว' : 'สำรองไม่สำเร็จ');
-    } catch { toast('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้'); }
+      const res = await callServer('backup');
+      toast(`สำรองข้อมูลแล้ว ${res.file || ''}`);
+    } catch (err) { toast('สำรองไม่สำเร็จ: ' + err.message); }
   }
   if (e.target.matches('[data-demo]')) {
     if (!confirm('เพิ่มลูกค้าตัวอย่าง 500 ราย และออเดอร์ 3,000 รายการ?')) return;

@@ -15,15 +15,53 @@ export async function getConfig() {
 export const pendingCount = () =>
   STORES.reduce((n, s) => n + [...mem[s].values()].filter((r) => r._dirty).length, 0);
 
-export function sync() {
-  if (!running) running = doSync().finally(() => { running = null; });
+export function sync(opts) {
+  if (!running) running = doSync(opts).finally(() => { running = null; });
   return running;
 }
 
-async function doSync() {
+// Google Apps Script web apps (URL ends in /exec) only accept "simple" CORS requests:
+// text/plain body with the token inside instead of an Authorization header.
+export const isAppsScript = (url) => /\/exec\/?$/.test(url.trim());
+
+export async function callServer(action, payload = {}) {
   const { url, token } = await getConfig();
+  if (!url) throw new Error('ยังไม่ได้ตั้งค่าเซิร์ฟเวอร์');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000);
+  let res;
+  try {
+    res = isAppsScript(url)
+      ? await fetch(url.trim(), {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ ...payload, action, token }),
+        signal: ctrl.signal,
+      })
+      : await fetch(url.replace(/\/+$/, '') + '/api/' + action, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? 'หมดเวลาเชื่อมต่อ' : 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ (ตรวจสอบ URL และการ Deploy แบบ Anyone)');
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) throw new Error(res.status === 401 ? 'รหัสซิงค์ไม่ถูกต้อง' : `เซิร์ฟเวอร์ตอบกลับ ${res.status}`);
+  let data;
+  try { data = await res.json(); } catch { throw new Error('เซิร์ฟเวอร์ตอบกลับไม่ถูกต้อง (ตรวจสอบ URL)'); }
+  if (data.error) throw new Error(data.error === 'unauthorized' ? 'รหัสซิงค์ไม่ถูกต้อง' : data.error);
+  return data;
+}
+
+async function doSync({ periodic = false } = {}) {
+  const { url } = await getConfig();
   if (!url) { set({ status: 'off', error: '' }); return false; }
   if (!navigator.onLine) { set({ status: 'offline', error: '' }); return false; }
+  // Apps Script is slower and quota-limited: when nothing changed locally, poll every 3 minutes.
+  if (periodic && isAppsScript(url) && !pendingCount() && Date.now() - state.lastSyncAt < 180000) return true;
   set({ status: 'syncing', error: '' });
   try {
     const since = (await getMeta('cursor')) || 0;
@@ -31,16 +69,7 @@ async function doSync() {
     for (const s of STORES) {
       changes[s] = [...mem[s].values()].filter((r) => r._dirty).map(({ _dirty, ...r }) => r);
     }
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
-    const res = await fetch(url.replace(/\/+$/, '') + '/api/sync', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
-      body: JSON.stringify({ since, changes }),
-      signal: ctrl.signal,
-    }).finally(() => clearTimeout(timer));
-    if (!res.ok) throw new Error(res.status === 401 ? 'รหัสซิงค์ไม่ถูกต้อง' : `เซิร์ฟเวอร์ตอบกลับ ${res.status}`);
-    const data = await res.json();
+    const data = await callServer('sync', { since, changes });
 
     // Clear the dirty flag only for records not edited again while the request was in flight.
     for (const s of STORES) {
@@ -58,7 +87,7 @@ async function doSync() {
     set({ status: 'ok', lastSyncAt: now });
     return true;
   } catch (e) {
-    set({ status: 'error', error: e.name === 'AbortError' ? 'หมดเวลาเชื่อมต่อ' : e.message });
+    set({ status: 'error', error: e.message });
     return false;
   }
 }
@@ -74,6 +103,6 @@ export async function startAutoSync() {
   window.addEventListener('online', () => scheduleSync(500));
   window.addEventListener('offline', () => set({ status: 'offline' }));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(300); });
-  setInterval(() => { if (!document.hidden) sync(); }, 60000);
+  setInterval(() => { if (!document.hidden) sync({ periodic: true }); }, 60000);
   scheduleSync(300);
 }
