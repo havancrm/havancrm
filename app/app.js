@@ -5,42 +5,109 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const main = $('#main');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (n) => '฿' + (Number(n) || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
+const num = (n) => (Number(n) || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
 const today = () => localDate(new Date());
 const localDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const thaiDate = (s) => s ? new Date(s + 'T00:00:00').toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' }) : '';
+const daysBetween = (a, b) => Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000);
 const PAGE = 100;
 
 const STATUS = {
-  pending: { label: 'รอชำระ', cls: 'warn' },
+  pending: { label: 'รอดำเนินการ', cls: 'warn' },
+  sent: { label: 'ส่งออฟฟิศแล้ว', cls: 'info' },
+  billed: { label: 'เปิดบิลแล้ว', cls: 'ok' },
   paid: { label: 'ชำระแล้ว', cls: 'ok' },
-  shipped: { label: 'ส่งแล้ว', cls: 'info' },
+  shipped: { label: 'ส่งของแล้ว', cls: 'info' },
   cancelled: { label: 'ยกเลิก', cls: 'muted' },
+  excluded: { label: 'ไม่นับยอด', cls: 'muted' },
 };
+const EDITABLE_STATUS = ['pending', 'paid', 'shipped', 'cancelled'];
 
 // ---------- derived data ----------
-const orderTotal = (o) => Math.max(0, (o.items || []).reduce((s, i) => s + (Number(i.qty) || 0) * (Number(i.price) || 0), 0) - (Number(o.discount) || 0));
-const activeOrders = () => db.list('orders').filter((o) => o.status !== 'cancelled');
+// When connected to A-CRM, sales come only from ACTIVE bills; orders are requests to the office.
+const isAcrm = () => syncState().backend === 'acrm';
+const isSale = (o) => (isAcrm() ? o.kind === 'bill' && o.status === 'billed' : !['cancelled', 'excluded'].includes(o.status));
+const orderTotal = (o) => typeof o.total === 'number' ? o.total
+  : Math.max(0, (o.items || []).reduce((s, i) => s + (Number(i.qty) || 0) * (Number(i.price) || 0), 0) - (Number(o.discount) || 0));
+const byDateDesc = (a, b) => (b.date || '').localeCompare(a.date || '') || String(b.no).localeCompare(String(a.no));
+const customerLabel = (c) => (c.code ? `${c.name} · ${c.code}` : c.name);
 
-function customerStats() {
-  const stats = new Map();
-  for (const o of activeOrders()) {
-    const s = stats.get(o.customerId) || { total: 0, count: 0, last: '', unpaid: 0 };
-    const t = orderTotal(o);
-    s.total += t; s.count += 1;
-    if (o.date > s.last) s.last = o.date;
-    if (o.status === 'pending') s.unpaid += t;
-    stats.set(o.customerId, s);
-  }
-  return stats;
+// Memoized per data version so list/detail screens stay fast with thousands of bills.
+let dataVersion = 0;
+const memo = new Map();
+function cached(key, fn) {
+  const hit = memo.get(key);
+  if (hit && hit.v === dataVersion) return hit.value;
+  const value = fn();
+  memo.set(key, { v: dataVersion, value });
+  return value;
 }
 
-function nextOrderNo() {
-  const prefix = 'SO' + today().replace(/-/g, '').slice(2);
-  let max = 0;
-  for (const o of db.list('orders')) {
-    if (o.no?.startsWith(prefix)) max = Math.max(max, Number(o.no.slice(prefix.length + 1)) || 0);
+const saleOrders = () => cached('sales', () => db.list('orders').filter(isSale));
+
+function customerStats() {
+  return cached('stats', () => {
+    const stats = new Map();
+    for (const o of saleOrders()) {
+      let s = stats.get(o.customerId);
+      if (!s) stats.set(o.customerId, s = { total: 0, count: 0, first: o.date, last: o.date, dates: new Set() });
+      s.total += orderTotal(o);
+      s.count += 1;
+      if (o.date) {
+        s.dates.add(o.date);
+        if (o.date > s.last) s.last = o.date;
+        if (o.date < s.first) s.first = o.date;
+      }
+    }
+    const t = today();
+    for (const s of stats.values()) {
+      s.days = s.last ? daysBetween(s.last, t) : null;
+      // Average days between purchases, once there are at least 3 purchase days.
+      s.cycle = s.dates.size >= 3 ? Math.round(daysBetween(s.first, s.last) / (s.dates.size - 1)) : null;
+    }
+    return stats;
+  });
+}
+
+// Customers whose gap since the last purchase is clearly longer than their usual cycle.
+function followUps(limit = 8) {
+  const stats = customerStats();
+  const out = [];
+  for (const c of db.list('customers')) {
+    const s = stats.get(c.id);
+    if (c.inactive || !s?.cycle || s.days < 7 || s.days < s.cycle * 1.2) continue;
+    out.push({ c, s, ratio: s.days / Math.max(1, s.cycle) });
   }
-  return `${prefix}-${String(max + 1).padStart(3, '0')}`;
+  return out.sort((a, b) => b.ratio - a.ratio).slice(0, limit);
+}
+
+// Latest price/unit/code per product name, overall or for one customer.
+function productIndex(customerId) {
+  return cached('products:' + (customerId || ''), () => {
+    const map = new Map();
+    const list = customerId ? saleOrders().filter((o) => o.customerId === customerId) : saleOrders();
+    for (const o of [...list].sort((a, b) => (a.date || '').localeCompare(b.date || ''))) {
+      for (const i of o.items || []) {
+        if (!i.name) continue;
+        const p = map.get(i.name) || { count: 0 };
+        p.count += 1;
+        p.date = o.date;
+        if (i.price !== null && i.price !== undefined) p.price = i.price;
+        if (i.unit) p.unit = i.unit;
+        if (i.code) p.code = i.code;
+        p.qty = i.qty;
+        map.set(i.name, p);
+      }
+    }
+    return map;
+  });
+}
+
+function newOrderId() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const be = String(d.getFullYear() + 543).slice(2);
+  return `O-${be}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${Math.random().toString(36).slice(2, 4)}`;
 }
 
 const matches = (q, ...fields) => !q || fields.some((f) => String(f ?? '').toLowerCase().includes(q));
@@ -62,7 +129,7 @@ let viewCtrl = new AbortController(); // removes listeners bound to #main when t
 function parseHash() {
   const [path, query = ''] = location.hash.replace(/^#\/?/, '').split('?');
   const [name, id] = path.split('/');
-  return { name: name || '', id, params: new URLSearchParams(query) };
+  return { name: name || '', id: id && decodeURIComponent(id), params: new URLSearchParams(query) };
 }
 
 function render() {
@@ -81,21 +148,22 @@ function render() {
 }
 
 const go = (hash) => { location.hash = hash; };
+const link = (name, id, query = '') => `#/${name}/${encodeURIComponent(id)}${query}`;
 window.addEventListener('hashchange', () => { viewState = {}; render(); window.scrollTo(0, 0); });
 
 // ---------- views ----------
 function dashboard() {
-  const orders = activeOrders();
   const t = today();
   const month = t.slice(0, 7);
+  const year = t.slice(0, 4);
   const lastMonthDate = new Date(); lastMonthDate.setDate(1); lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
   const lastMonth = localDate(lastMonthDate).slice(0, 7);
-  let todaySum = 0, monthSum = 0, lastMonthSum = 0, monthCount = 0, unpaid = 0;
+  let todaySum = 0, monthSum = 0, lastMonthSum = 0, monthCount = 0, yearSum = 0;
   const days = [];
   for (let i = 6; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); days.push({ date: localDate(d), sum: 0 }); }
   const dayIdx = new Map(days.map((d, i) => [d.date, i]));
   const byCustomer = new Map();
-  for (const o of orders) {
+  for (const o of saleOrders()) {
     const v = orderTotal(o);
     if (o.date === t) todaySum += v;
     if (o.date?.startsWith(month)) {
@@ -103,21 +171,23 @@ function dashboard() {
       byCustomer.set(o.customerId, (byCustomer.get(o.customerId) || 0) + v);
     }
     if (o.date?.startsWith(lastMonth)) lastMonthSum += v;
-    if (o.status === 'pending') unpaid += v;
+    if (o.date?.startsWith(year)) yearSum += v;
     if (dayIdx.has(o.date)) days[dayIdx.get(o.date)].sum += v;
   }
   const growth = lastMonthSum ? ((monthSum - lastMonthSum) / lastMonthSum) * 100 : null;
   const max = Math.max(1, ...days.map((d) => d.sum));
   const top = [...byCustomer.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const recent = db.list('orders').sort((a, b) => (b.date + b.no).localeCompare(a.date + a.no)).slice(0, 5);
+  const follow = followUps();
+  const recent = [...db.list('orders')].sort(byDateDesc).slice(0, 5);
+  const unit = isAcrm() ? 'บิล' : 'ออเดอร์';
 
   return `
   <h1>ภาพรวมยอดขาย</h1>
   <div class="kpis">
     <div class="kpi"><span>วันนี้</span><b>${money(todaySum)}</b></div>
-    <div class="kpi"><span>เดือนนี้ (${monthCount} ออเดอร์)</span><b>${money(monthSum)}</b>
+    <div class="kpi"><span>เดือนนี้ (${monthCount} ${unit})</span><b>${money(monthSum)}</b>
       ${growth === null ? '' : `<small class="${growth >= 0 ? 'up' : 'down'}">${growth >= 0 ? '▲' : '▼'} ${Math.abs(growth).toFixed(0)}% จากเดือนก่อน</small>`}</div>
-    <div class="kpi"><span>ค้างชำระ</span><b class="warn-text">${money(unpaid)}</b></div>
+    <div class="kpi"><span>ปีนี้</span><b>${money(yearSum)}</b></div>
     <div class="kpi"><span>ลูกค้าทั้งหมด</span><b>${db.list('customers').length.toLocaleString('th-TH')}</b></div>
   </div>
   <section class="card">
@@ -130,23 +200,33 @@ function dashboard() {
     </div>
   </section>
   <section class="card">
-    <h2>ลูกค้ายอดซื้อสูงสุดเดือนนี้</h2>
-    ${top.length ? `<ol class="rank">${top.map(([id, v]) => `<li><a href="#/customer/${id}">${esc(db.get('customers', id)?.name || '(ลบแล้ว)')}</a><b>${money(v)}</b></li>`).join('')}</ol>` : '<p class="empty">ยังไม่มียอดขายเดือนนี้</p>'}
+    <h2>ลูกค้าที่ควรติดตาม</h2>
+    ${follow.length ? `<ul class="list">${follow.map(({ c, s }) => `<li><a href="${link('customer', c.id)}">
+      <div><b>${esc(c.name)}</b><small>ปกติซื้อทุก ~${s.cycle} วัน · ซื้อล่าสุด ${thaiDate(s.last)}</small></div>
+      <div class="right"><b class="warn-text">${s.days} วัน</b><small>ไม่ได้ซื้อ</small></div>
+    </a></li>`).join('')}</ul>` : '<p class="empty">ยังไม่มีลูกค้าที่ขาดการสั่งซื้อผิดปกติ</p>'}
   </section>
   <section class="card">
-    <h2>ออเดอร์ล่าสุด <a class="more" href="#/orders">ทั้งหมด</a></h2>
-    ${recent.length ? orderRows(recent) : '<p class="empty">ยังไม่มีออเดอร์</p>'}
+    <h2>ลูกค้ายอดซื้อสูงสุดเดือนนี้</h2>
+    ${top.length ? `<ol class="rank">${top.map(([id, v]) => `<li><a href="${link('customer', id)}">${esc(db.get('customers', id)?.name || id || '(ไม่ระบุ)')}</a><b>${money(v)}</b></li>`).join('')}</ol>` : '<p class="empty">ยังไม่มียอดขายเดือนนี้</p>'}
+  </section>
+  <section class="card">
+    <h2>ล่าสุด <a class="more" href="#/orders">ทั้งหมด</a></h2>
+    ${recent.length ? orderRows(recent) : '<p class="empty">ยังไม่มีข้อมูล</p>'}
   </section>
   <a class="fab" href="#/order-edit/new" aria-label="สร้างออเดอร์">＋</a>`;
 }
 
-function orderRows(list) {
+function orderRows(list, { showCustomer = true } = {}) {
   return `<ul class="list">${list.map((o) => {
     const c = db.get('customers', o.customerId);
     const st = STATUS[o.status] || STATUS.pending;
-    return `<li><a href="#/order/${o.id}">
-      <div><b>${esc(c?.name || '(ไม่ระบุลูกค้า)')}</b><small>${esc(o.no)} · ${thaiDate(o.date)}</small></div>
-      <div class="right"><b>${money(orderTotal(o))}</b><span class="badge ${st.cls}">${st.label}</span></div>
+    const kind = o.kind === 'bill' ? 'บิล ' : '';
+    const title = showCustomer ? esc(c?.name || o.customerId || '(ไม่ระบุลูกค้า)') : `${kind}${esc(o.no)}`;
+    const sub = showCustomer ? `${kind}${esc(o.no)} · ${thaiDate(o.date)}` : `${thaiDate(o.date)} · ${(o.items || []).length} รายการ`;
+    return `<li><a href="${link('order', o.id)}">
+      <div><b>${title}</b><small>${sub}${o._dirty ? ' · ⟳ รอซิงค์' : ''}</small></div>
+      <div class="right"><b>${o.priceUnknown ? 'ไม่ทราบราคา' : money(orderTotal(o))}</b><span class="badge ${st.cls}">${st.label}</span></div>
     </a></li>`;
   }).join('')}</ul>`;
 }
@@ -154,9 +234,9 @@ function orderRows(list) {
 function customers() {
   return `
   <h1>ลูกค้า</h1>
-  <input class="search" type="search" placeholder="ค้นหา ชื่อ / เบอร์ / บริษัท / แท็ก" data-init="customers" value="${esc(viewState.q || '')}" autocomplete="off">
+  <input class="search" type="search" placeholder="ค้นหา ชื่อ / รหัส / เบอร์ / จังหวัด / ประเภท" data-init="customers" value="${esc(viewState.q || '')}" autocomplete="off">
   <div id="results"></div>
-  <a class="fab" href="#/customer-edit/new" aria-label="เพิ่มลูกค้า">＋</a>`;
+  ${isAcrm() ? '' : '<a class="fab" href="#/customer-edit/new" aria-label="เพิ่มลูกค้า">＋</a>'}`;
 }
 
 function renderCustomerResults() {
@@ -164,15 +244,16 @@ function renderCustomerResults() {
   const q = (viewState.q || '').trim().toLowerCase();
   const stats = customerStats();
   const list = db.list('customers')
-    .filter((c) => matches(q, c.name, c.phone, c.company, c.tags, c.line, c.email))
+    .filter((c) => matches(q, c.name, c.code, c.phones || c.phone, c.company, c.tags, c.line, c.email, c.province, c.businessType, c.contact))
     .sort((a, b) => (stats.get(b.id)?.last || '').localeCompare(stats.get(a.id)?.last || '') || a.name.localeCompare(b.name, 'th'));
   const limit = viewState.limit || PAGE;
   $('#results').innerHTML = `<p class="count">${list.length.toLocaleString('th-TH')} รายการ</p>` + (list.length ? `
     <ul class="list">${list.slice(0, limit).map((c) => {
       const s = stats.get(c.id);
-      return `<li><a href="#/customer/${c.id}">
-        <div><b>${esc(c.name)}</b><small>${esc([c.company, c.phone].filter(Boolean).join(' · '))}</small></div>
-        <div class="right"><b>${money(s?.total)}</b><small>${s ? `${s.count} ออเดอร์` : 'ยังไม่มีออเดอร์'}</small></div>
+      const sub = [c.code, c.businessType || c.company, c.province, c.phone].filter(Boolean).join(' · ');
+      return `<li><a href="${link('customer', c.id)}">
+        <div><b>${esc(c.name)}${c.inactive ? ' <span class="badge muted">ไม่ใช้งาน</span>' : ''}</b><small>${esc(sub)}</small></div>
+        <div class="right"><b>${money(s?.total)}</b><small>${s?.last ? `ล่าสุด ${thaiDate(s.last)}` : 'ยังไม่มียอดซื้อ'}</small></div>
       </a></li>`;
     }).join('')}</ul>
     ${list.length > limit ? '<button class="btn ghost wide" data-more>แสดงเพิ่ม</button>' : ''}` : '<p class="empty">ไม่พบลูกค้า</p>');
@@ -182,29 +263,42 @@ function renderCustomerResults() {
 function customerDetail({ id }) {
   const c = db.get('customers', id);
   if (!c) return '<p class="empty">ไม่พบลูกค้า</p>';
-  const s = customerStats().get(id) || { total: 0, count: 0, last: '', unpaid: 0 };
-  const orders = db.list('orders').filter((o) => o.customerId === id).sort((a, b) => (b.date + b.no).localeCompare(a.date + a.no));
+  const s = customerStats().get(id);
+  const all = db.list('orders').filter((o) => o.customerId === id).sort(byDateDesc);
+  const lastSale = all.find(isSale) || all[0];
   const phone = (c.phone || '').replace(/[^\d+]/g, '');
+  const map = c.mapLink || (c.address ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([c.address, c.district, c.province].filter(Boolean).join(' '))}` : '');
+  const regular = [...productIndex(id).entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 6);
+  const info = [
+    ['รหัสลูกค้า', c.code], ['ผู้ติดต่อ', c.contact], ['เบอร์โทร', c.phones || c.phone], ['LINE', c.line], ['อีเมล', c.email],
+    ['ที่อยู่', [c.address, c.district, c.province].filter(Boolean).join(' ')], ['ประเภทธุรกิจ', c.businessType || c.company],
+    ['เซลล์ผู้ดูแล', c.owner], ['แท็ก', c.tags], ['บันทึก', c.note],
+  ].filter(([, v]) => v);
   return `
-  <div class="head"><a href="#/customers" class="back">‹ ลูกค้า</a><a href="#/customer-edit/${id}" class="btn small">แก้ไข</a></div>
+  <div class="head"><a href="#/customers" class="back">‹ ลูกค้า</a>${c.src ? '<span class="src">ข้อมูลจาก A-CRM</span>' : `<a href="${link('customer-edit', id)}" class="btn small">แก้ไข</a>`}</div>
   <h1>${esc(c.name)}</h1>
-  ${c.company ? `<p class="sub">${esc(c.company)}</p>` : ''}
+  ${c.code || c.businessType ? `<p class="sub">${esc([c.code, c.businessType].filter(Boolean).join(' · '))}</p>` : ''}
   <div class="actions">
     ${phone ? `<a class="btn" href="tel:${esc(phone)}">📞 โทร</a>` : ''}
     ${c.line ? `<a class="btn" href="https://line.me/ti/p/~${encodeURIComponent(c.line)}" target="_blank" rel="noopener">💬 LINE</a>` : ''}
-    <a class="btn primary" href="#/order-edit/new?customer=${id}">＋ ออเดอร์</a>
+    ${map ? `<a class="btn" href="${esc(map)}" target="_blank" rel="noopener">📍 แผนที่</a>` : ''}
+  </div>
+  <div class="actions">
+    <a class="btn primary" href="#/order-edit/new?customer=${encodeURIComponent(id)}">＋ ออเดอร์ใหม่</a>
+    ${lastSale ? `<a class="btn" href="#/order-edit/new?customer=${encodeURIComponent(id)}&repeat=${encodeURIComponent(lastSale.id)}">↻ สั่งซ้ำล่าสุด</a>` : ''}
   </div>
   <div class="kpis">
-    <div class="kpi"><span>ยอดซื้อรวม</span><b>${money(s.total)}</b></div>
-    <div class="kpi"><span>จำนวนออเดอร์</span><b>${s.count}</b></div>
-    <div class="kpi"><span>ซื้อล่าสุด</span><b>${s.last ? thaiDate(s.last) : '-'}</b></div>
-    <div class="kpi"><span>ค้างชำระ</span><b class="warn-text">${money(s.unpaid)}</b></div>
+    <div class="kpi"><span>ยอดซื้อรวม</span><b>${money(s?.total)}</b></div>
+    <div class="kpi"><span>จำนวน${isAcrm() ? 'บิล' : 'ออเดอร์'}</span><b>${s?.count || 0}</b></div>
+    <div class="kpi"><span>ซื้อล่าสุด</span><b>${s?.last ? thaiDate(s.last) : '-'}</b>${s?.last ? `<small>${s.days} วันก่อน</small>` : ''}</div>
+    <div class="kpi"><span>ซื้อเฉลี่ยทุก</span><b>${s?.cycle ? `${s.cycle} วัน` : '-'}</b>${s?.cycle && s.days > s.cycle * 1.2 ? '<small class="down">เลยรอบแล้ว</small>' : ''}</div>
   </div>
+  ${regular.length ? `<section class="card"><h2>สินค้าที่ซื้อประจำ</h2><ul class="plain">${regular.map(([name, p]) => `
+    <li><span>${esc(name)}</span><small>${p.count} ครั้ง · ล่าสุด ${num(p.qty)} ${esc(p.unit || '')}${p.price != null ? ` @ ${money(p.price)}` : ''}</small></li>`).join('')}</ul></section>` : ''}
   <section class="card info">
-    ${[['เบอร์โทร', c.phone], ['LINE', c.line], ['อีเมล', c.email], ['ที่อยู่', c.address], ['แท็ก', c.tags], ['บันทึก', c.note]]
-      .filter(([, v]) => v).map(([k, v]) => `<div><span>${k}</span><p>${esc(v)}</p></div>`).join('') || '<p class="empty">ไม่มีข้อมูลเพิ่มเติม</p>'}
+    ${info.map(([k, v]) => `<div><span>${k}</span><p>${esc(v)}</p></div>`).join('') || '<p class="empty">ไม่มีข้อมูลเพิ่มเติม</p>'}
   </section>
-  <section class="card"><h2>ประวัติการสั่งซื้อ</h2>${orders.length ? orderRows(orders) : '<p class="empty">ยังไม่มีออเดอร์</p>'}</section>`;
+  <section class="card"><h2>ประวัติการสั่งซื้อ (${all.length})</h2>${all.length ? orderRows(all.slice(0, 100), { showCustomer: false }) : '<p class="empty">ยังไม่มีประวัติ</p>'}</section>`;
 }
 
 function field(name, label, value, attrs = '') {
@@ -214,8 +308,9 @@ function field(name, label, value, attrs = '') {
 function customerEdit({ id }) {
   const c = id === 'new' ? {} : db.get('customers', id);
   if (!c) return '<p class="empty">ไม่พบลูกค้า</p>';
+  if (c.src || (id === 'new' && isAcrm())) return '<p class="empty">ข้อมูลลูกค้าแก้ไขได้ในระบบ A-CRM เท่านั้น</p>';
   return `
-  <div class="head"><a href="${id === 'new' ? '#/customers' : `#/customer/${id}`}" class="back">‹ ยกเลิก</a></div>
+  <div class="head"><a href="${id === 'new' ? '#/customers' : link('customer', id)}" class="back">‹ ยกเลิก</a></div>
   <h1>${id === 'new' ? 'เพิ่มลูกค้า' : 'แก้ไขลูกค้า'}</h1>
   <form class="form" data-init="customer-form">
     ${field('name', 'ชื่อลูกค้า *', c.name, 'required autofocus')}
@@ -233,11 +328,12 @@ function customerEdit({ id }) {
 
 function orders() {
   const f = viewState.status || 'all';
+  const present = new Set(db.list('orders').map((o) => o.status));
+  const chips = [['all', 'ทั้งหมด'], ...Object.entries(STATUS).filter(([k]) => present.has(k)).map(([k, v]) => [k, v.label])];
   return `
-  <h1>ออเดอร์</h1>
+  <h1>${isAcrm() ? 'บิล & ออเดอร์' : 'ออเดอร์'}</h1>
   <input class="search" type="search" placeholder="ค้นหา เลขที่ / ลูกค้า / สินค้า" data-init="orders" value="${esc(viewState.q || '')}" autocomplete="off">
-  <div class="chips">${[['all', 'ทั้งหมด'], ...Object.entries(STATUS).map(([k, v]) => [k, v.label])]
-    .map(([k, l]) => `<button class="chip ${f === k ? 'active' : ''}" data-status="${k}">${l}</button>`).join('')}</div>
+  <div class="chips">${chips.map(([k, l]) => `<button class="chip ${f === k ? 'active' : ''}" data-status="${k}">${l}</button>`).join('')}</div>
   <div id="results"></div>
   <a class="fab" href="#/order-edit/new" aria-label="สร้างออเดอร์">＋</a>`;
 }
@@ -248,58 +344,73 @@ function renderOrderResults() {
   const f = viewState.status || 'all';
   const list = db.list('orders')
     .filter((o) => (f === 'all' || o.status === f) &&
-      matches(q, o.no, db.get('customers', o.customerId)?.name, ...(o.items || []).map((i) => i.name)))
-    .sort((a, b) => (b.date + b.no).localeCompare(a.date + a.no));
-  const sum = list.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + orderTotal(o), 0);
+      matches(q, o.no, o.customerId, db.get('customers', o.customerId)?.name, ...(o.items || []).map((i) => i.name)))
+    .sort(byDateDesc);
+  const sum = list.filter(isSale).reduce((s, o) => s + orderTotal(o), 0);
   const limit = viewState.limit || PAGE;
-  $('#results').innerHTML = `<p class="count">${list.length.toLocaleString('th-TH')} รายการ · รวม ${money(sum)}</p>` +
-    (list.length ? orderRows(list.slice(0, limit)) + (list.length > limit ? '<button class="btn ghost wide" data-more>แสดงเพิ่ม</button>' : '') : '<p class="empty">ไม่พบออเดอร์</p>');
+  $('#results').innerHTML = `<p class="count">${list.length.toLocaleString('th-TH')} รายการ · ยอดขาย ${money(sum)}</p>` +
+    (list.length ? orderRows(list.slice(0, limit)) + (list.length > limit ? '<button class="btn ghost wide" data-more>แสดงเพิ่ม</button>' : '') : '<p class="empty">ไม่พบรายการ</p>');
   $('#perf').textContent = `${(performance.now() - t0).toFixed(0)} ms`;
 }
 
 function orderDetail({ id }) {
   const o = db.get('orders', id);
-  if (!o) return '<p class="empty">ไม่พบออเดอร์</p>';
+  if (!o) return '<p class="empty">ไม่พบรายการ</p>';
   const c = db.get('customers', o.customerId);
+  const meta = [['เซลล์', o.salesperson], ['ผู้เปิดบิล', o.opener], ['เงื่อนไขชำระ', o.terms]].filter(([, v]) => v);
   return `
-  <div class="head"><a href="#/orders" class="back">‹ ออเดอร์</a><a href="#/order-edit/${id}" class="btn small">แก้ไข</a></div>
-  <h1>${esc(o.no)}</h1>
-  <p class="sub">${thaiDate(o.date)} · ${c ? `<a href="#/customer/${c.id}">${esc(c.name)}</a>` : '(ไม่ระบุลูกค้า)'}</p>
-  <div class="chips" data-init="order-status">${Object.entries(STATUS)
-    .map(([k, v]) => `<button class="chip ${o.status === k ? 'active' : ''}" data-set-status="${k}">${v.label}</button>`).join('')}</div>
+  <div class="head"><a href="#/orders" class="back">‹ รายการ</a>${o.src ? '<span class="src">ข้อมูลจาก A-CRM</span>' : `<a href="${link('order-edit', id)}" class="btn small">แก้ไข</a>`}</div>
+  <h1>${o.kind === 'bill' ? 'บิล ' : ''}${esc(o.no)}</h1>
+  <p class="sub">${thaiDate(o.date)} · ${c ? `<a href="${link('customer', c.id)}">${esc(c.name)}</a>` : esc(o.customerId || '(ไม่ระบุลูกค้า)')}</p>
+  ${o.src ? `<p><span class="badge ${(STATUS[o.status] || STATUS.pending).cls}">${(STATUS[o.status] || STATUS.pending).label}</span></p>`
+    : `<div class="chips" data-init="order-status">${EDITABLE_STATUS.map((k) => `<button class="chip ${o.status === k ? 'active' : ''}" data-set-status="${k}">${STATUS[k].label}</button>`).join('')}</div>`}
+  ${o._dirty && isAcrm() ? `<p class="hint">⟳ ยังไม่ได้ส่งเข้า A-CRM${syncState().readOnly ? ' (ฐานข้อมูลเปิดแบบอ่านอย่างเดียว)' : ''}</p>` : ''}
   <section class="card">
     <table class="items"><thead><tr><th>สินค้า</th><th>จำนวน</th><th>ราคา</th><th>รวม</th></tr></thead><tbody>
-    ${(o.items || []).map((i) => `<tr><td>${esc(i.name)}</td><td>${Number(i.qty).toLocaleString('th-TH')}</td><td>${money(i.price)}</td><td>${money(i.qty * i.price)}</td></tr>`).join('')}
+    ${(o.items || []).map((i) => {
+      const known = i.price !== null && i.price !== undefined;
+      return `<tr><td>${esc(i.name)}</td><td>${num(i.qty)} ${esc(i.unit || '')}</td><td>${known ? money(i.price) : '-'}</td><td>${known ? money(i.qty * i.price) : '-'}</td></tr>`;
+    }).join('')}
     </tbody>
     <tfoot>${Number(o.discount) ? `<tr><td colspan="3">ส่วนลด</td><td>-${money(o.discount)}</td></tr>` : ''}
-    <tr><th colspan="3">ยอดสุทธิ</th><th>${money(orderTotal(o))}</th></tr></tfoot></table>
+    <tr><th colspan="3">ยอดสุทธิ</th><th>${o.priceUnknown ? 'ไม่ทราบราคา' : money(orderTotal(o))}</th></tr></tfoot></table>
+    ${o.priceUnknown ? '<p class="hint">ออเดอร์เดิมไม่มีราคาครบ ระบบจะไม่เดาราคาย้อนหลัง</p>' : ''}
   </section>
-  ${o.note ? `<section class="card info"><div><span>บันทึก</span><p>${esc(o.note)}</p></div></section>` : ''}`;
+  ${meta.length || o.note ? `<section class="card info">${meta.map(([k, v]) => `<div><span>${k}</span><p>${esc(v)}</p></div>`).join('')}
+    ${o.note ? `<div><span>บันทึก</span><p>${esc(o.note)}</p></div>` : ''}</section>` : ''}
+  ${o.customerId ? `<a class="btn wide" href="#/order-edit/new?customer=${encodeURIComponent(o.customerId)}&repeat=${encodeURIComponent(o.id)}">↻ สั่งซ้ำรายการนี้</a>` : ''}`;
 }
 
 function orderEdit({ id, params }) {
-  const o = id === 'new'
-    ? { no: nextOrderNo(), date: today(), status: 'pending', customerId: params.get('customer') || '', items: [{ name: '', qty: 1, price: '' }], discount: '' }
-    : db.get('orders', id);
+  let o;
+  if (id === 'new') {
+    const repeat = params.get('repeat') && db.get('orders', params.get('repeat'));
+    const oid = newOrderId();
+    o = {
+      id: oid, no: oid, date: today(), status: 'pending', customerId: params.get('customer') || '', discount: '',
+      items: repeat ? repeat.items.map(({ name, qty, price, unit, code }) => ({ name, qty, price: price ?? '', unit, code })) : [{ name: '', qty: 1, price: '' }],
+    };
+  } else {
+    o = db.get('orders', id);
+    if (o?.src) return '<p class="empty">รายการจาก A-CRM แก้ไขได้ในระบบ A-CRM เท่านั้น</p>';
+  }
   if (!o) return '<p class="empty">ไม่พบออเดอร์</p>';
-  const custs = db.list('customers').sort((a, b) => a.name.localeCompare(b.name, 'th'));
+  const custs = db.list('customers').filter((c) => !c.inactive).sort((a, b) => a.name.localeCompare(b.name, 'th'));
   const cur = db.get('customers', o.customerId);
-  // Remember product names + last price for fast entry.
-  const products = new Map();
-  for (const ord of db.list('orders')) for (const i of ord.items || []) if (i.name) products.set(i.name, i.price);
-  viewState.products = products;
+  const products = productIndex();
+  viewState.newId = o.id;
   return `
-  <div class="head"><a href="${id === 'new' ? '#/orders' : `#/order/${id}`}" class="back">‹ ยกเลิก</a></div>
+  <div class="head"><a href="${id === 'new' ? '#/orders' : link('order', id)}" class="back">‹ ยกเลิก</a></div>
   <h1>${id === 'new' ? 'สร้างออเดอร์' : 'แก้ไขออเดอร์'}</h1>
   <form class="form" data-init="order-form">
     <div class="row">${field('no', 'เลขที่', o.no, 'required')}${field('date', 'วันที่', o.date, 'type="date" required')}</div>
-    <label>ลูกค้า *<input name="customer" list="custlist" value="${esc(cur ? cur.name : '')}" placeholder="พิมพ์ชื่อลูกค้า" required autocomplete="off"></label>
-    <datalist id="custlist">${custs.map((c) => `<option value="${esc(c.name)}">${esc(c.phone || '')}</option>`).join('')}</datalist>
-    <datalist id="prodlist">${[...products.keys()].map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>
+    <label>ลูกค้า *<input name="customer" list="custlist" value="${esc(cur ? customerLabel(cur) : '')}" placeholder="พิมพ์ชื่อหรือรหัสลูกค้า" required autocomplete="off"></label>
+    <datalist id="custlist">${custs.map((c) => `<option value="${esc(customerLabel(c))}">${esc(c.phone || '')}</option>`).join('')}</datalist>
+    <datalist id="prodlist">${[...products.entries()].sort((a, b) => b[1].count - a[1].count).map(([n]) => `<option value="${esc(n)}"></option>`).join('')}</datalist>
     <div class="items-edit" id="items">${(o.items || []).map(itemRow).join('')}</div>
     <button type="button" class="btn ghost wide" data-add-item>＋ เพิ่มรายการสินค้า</button>
     <div class="row">${field('discount', 'ส่วนลด (บาท)', o.discount, 'type="number" inputmode="decimal" min="0" step="any"')}
-      <label>สถานะ<select name="status">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${o.status === k ? 'selected' : ''}>${v.label}</option>`).join('')}</select></label></div>
+      <label>สถานะ<select name="status">${EDITABLE_STATUS.map((k) => `<option value="${k}" ${o.status === k ? 'selected' : ''}>${STATUS[k].label}</option>`).join('')}</select></label></div>
     <label>บันทึก<textarea name="note" rows="2">${esc(o.note)}</textarea></label>
     <p class="total">ยอดสุทธิ <b id="total">${money(orderTotal(o))}</b></p>
     <button class="btn primary wide">บันทึกออเดอร์</button>
@@ -310,22 +421,25 @@ function orderEdit({ id, params }) {
 function itemRow(i = { name: '', qty: 1, price: '' }) {
   return `<div class="item">
     <input name="iname" list="prodlist" placeholder="ชื่อสินค้า" value="${esc(i.name)}" autocomplete="off">
-    <input name="iqty" type="number" inputmode="decimal" min="0" step="any" placeholder="จำนวน" value="${esc(i.qty)}">
+    <input name="iqty" type="number" inputmode="decimal" min="0" step="any" placeholder="จำนวน${i.unit ? ` (${esc(i.unit)})` : ''}" value="${esc(i.qty)}">
     <input name="iprice" type="number" inputmode="decimal" min="0" step="any" placeholder="ราคา/หน่วย" value="${esc(i.price)}">
+    <input name="iunit" type="hidden" value="${esc(i.unit || '')}"><input name="icode" type="hidden" value="${esc(i.code || '')}">
     <button type="button" class="x" data-remove-item aria-label="ลบรายการ">✕</button>
   </div>`;
 }
 
 function settings() {
   const st = syncState();
+  const counts = db.list('orders').reduce((a, o) => { a[o.kind === 'bill' ? 'bills' : 'orders'] += 1; return a; }, { bills: 0, orders: 0 });
   return `
   <h1>ตั้งค่า & สำรองข้อมูล</h1>
   <section class="card">
     <h2>เชื่อมต่อฐานข้อมูล</h2>
-    <p class="hint">ใส่ URL ของ Google Sheet (Apps Script ที่ลงท้ายด้วย <code>/exec</code>) หรือที่อยู่เซิร์ฟเวอร์ HavanCRM ข้อมูลเก็บในเครื่องก่อน (ใช้งานออฟไลน์ได้) แล้วซิงค์อัตโนมัติ ทุกเครื่องที่ใช้ URL และรหัสเดียวกันจะเห็นข้อมูลเดียวกัน</p>
+    <p class="hint">ใส่ URL ของ Apps Script (ลงท้ายด้วย <code>/exec</code>) สำหรับ A-CRM หรือ Google Sheet หรือที่อยู่เซิร์ฟเวอร์ HavanCRM ข้อมูลเก็บในเครื่องก่อน (ใช้งานออฟไลน์ได้) แล้วซิงค์อัตโนมัติ</p>
     <form class="form" data-init="settings-form">
       ${field('url', 'URL ฐานข้อมูล', '', 'type="url" placeholder="https://script.google.com/macros/s/…/exec" inputmode="url"')}
       ${field('token', 'รหัสซิงค์ (SYNC_TOKEN)', '', 'type="password" autocomplete="off"')}
+      ${field('user', 'ชื่อผู้ใช้ (บันทึกเป็นผู้สร้างออเดอร์)', '', 'autocomplete="name"')}
       <button class="btn primary wide">บันทึก & ซิงค์ตอนนี้</button>
     </form>
     <p class="sync-status" id="sync-detail">${syncText(st)}</p>
@@ -339,14 +453,14 @@ function settings() {
   </section>
   <section class="card">
     <h2>ข้อมูลในเครื่อง</h2>
-    <p>ลูกค้า ${db.list('customers').length.toLocaleString('th-TH')} · ออเดอร์ ${db.list('orders').length.toLocaleString('th-TH')} · รอซิงค์ ${pendingCount()}</p>
-    <button class="btn ghost wide" data-demo>สร้างข้อมูลตัวอย่าง (ทดสอบความเร็ว)</button>
+    <p>ลูกค้า ${num(db.list('customers').length)} · ${counts.bills ? `บิล ${num(counts.bills)} · ` : ''}ออเดอร์ ${num(counts.orders)} · รอซิงค์ ${pendingCount()}</p>
+    ${isAcrm() ? '' : '<button class="btn ghost wide" data-demo>สร้างข้อมูลตัวอย่าง (ทดสอบความเร็ว)</button>'}
   </section>`;
 }
 
 function syncText(st) {
   const last = st.lastSyncAt ? new Date(st.lastSyncAt).toLocaleString('th-TH') : 'ยังไม่เคย';
-  return {
+  const text = {
     off: 'ยังไม่ได้เชื่อมต่อฐานข้อมูล — ข้อมูลเก็บในเครื่องนี้เท่านั้น',
     offline: `ออฟไลน์ — จะซิงค์เมื่อมีอินเทอร์เน็ต (ซิงค์ล่าสุด ${last})`,
     syncing: 'กำลังซิงค์…',
@@ -354,6 +468,11 @@ function syncText(st) {
     error: `ซิงค์ไม่สำเร็จ: ${esc(st.error)} (ซิงค์ล่าสุด ${last})`,
     idle: `ซิงค์ล่าสุด ${last}`,
   }[st.status] || '';
+  if (st.backend !== 'acrm') return text;
+  const mode = st.readOnly
+    ? `เชื่อมต่อ A-CRM แบบอ่านอย่างเดียว${st.rejected ? ` — ออเดอร์ใหม่ ${st.rejected} รายการเก็บไว้ในเครื่อง รอเปิดสิทธิ์เขียน` : ''}`
+    : 'เชื่อมต่อ A-CRM (ส่งออเดอร์ใหม่เข้า ORDERS ได้)';
+  return `${text}<br>${mode}`;
 }
 
 // ---------- event binding ----------
@@ -383,7 +502,7 @@ function bindView(r) {
       for (const k in d) d[k] = d[k].trim();
       const rec = db.save('customers', { ...(r.id !== 'new' && { id: r.id }), ...d });
       toast('บันทึกลูกค้าแล้ว');
-      go(`#/customer/${rec.id}`);
+      go(link('customer', rec.id));
     });
     form.querySelector('[data-delete]')?.addEventListener('click', () => {
       if (!confirm('ลบลูกค้ารายนี้? (ออเดอร์เดิมยังอยู่)')) return;
@@ -406,35 +525,57 @@ function bindView(r) {
 
   if (init === 'settings-form') {
     const form = main.querySelector('form');
-    getConfig().then(({ url, token }) => { form.url.value = url; form.token.value = token; });
+    Promise.all([getConfig(), db.getMeta('user')]).then(([{ url, token }, user]) => {
+      form.url.value = url; form.token.value = token; form.user.value = user || '';
+    });
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      await db.setMeta('serverUrl', form.url.value.trim());
+      const url = form.url.value.trim();
+      if (url !== (await getConfig()).url) await db.setMeta('cursor', 0); // new database: start from scratch
+      await db.setMeta('serverUrl', url);
       await db.setMeta('token', form.token.value.trim());
+      await db.setMeta('user', form.user.value.trim());
       const ok = await sync();
       toast(ok ? 'ซิงค์สำเร็จ' : 'ซิงค์ไม่สำเร็จ');
+      render();
     });
     main.addEventListener('click', onSettingsClick, { signal: viewCtrl.signal });
     main.querySelector('[data-import]').addEventListener('change', onImport);
   }
 }
 
+function findCustomer(input) {
+  const v = input.trim();
+  return db.list('customers').find((c) => customerLabel(c) === v || c.code === v)
+    || db.list('customers').find((c) => c.name === v);
+}
+
 function bindOrderForm(r) {
   const form = main.querySelector('form');
   const items = $('#items', form);
-  const readItems = () => [...items.querySelectorAll('.item')].map((el) => ({
-    name: el.querySelector('[name=iname]').value.trim(),
-    qty: Number(el.querySelector('[name=iqty]').value) || 0,
-    price: Number(el.querySelector('[name=iprice]').value) || 0,
-  })).filter((i) => i.name);
+  const readItems = () => [...items.querySelectorAll('.item')].map((el) => {
+    const val = (n) => el.querySelector(`[name=${n}]`).value.trim();
+    const it = { name: val('iname'), qty: Number(val('iqty')) || 0, price: Number(val('iprice')) || 0 };
+    if (val('iunit')) it.unit = val('iunit');
+    if (val('icode')) it.code = val('icode');
+    return it;
+  }).filter((i) => i.name);
   const updateTotal = () => {
     $('#total').textContent = money(orderTotal({ items: readItems(), discount: form.discount.value }));
   };
   form.addEventListener('input', (e) => {
-    // Auto-fill last used price when a known product is picked.
+    // Picking a known product fills this customer's last price (or the latest price overall).
     if (e.target.name === 'iname') {
-      const price = e.target.closest('.item').querySelector('[name=iprice]');
-      if (!price.value && viewState.products?.has(e.target.value)) price.value = viewState.products.get(e.target.value);
+      const row = e.target.closest('.item');
+      const cust = findCustomer(form.customer.value);
+      const p = (cust && productIndex(cust.id).get(e.target.value)) || productIndex().get(e.target.value);
+      row.querySelector('[name=iunit]').value = p?.unit || '';
+      row.querySelector('[name=icode]').value = p?.code || '';
+      if (p) {
+        const price = row.querySelector('[name=iprice]');
+        if (!price.value && p.price != null) price.value = p.price;
+        row.querySelector('[name=iqty]').placeholder = `จำนวน${p.unit ? ` (${p.unit})` : ''}`;
+      }
     }
     updateTotal();
   });
@@ -458,15 +599,17 @@ function bindOrderForm(r) {
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const name = form.customer.value.trim();
-    let cust = db.list('customers').find((c) => c.name === name);
+    let cust = findCustomer(name);
     if (!cust) {
+      if (isAcrm()) { toast('ไม่พบลูกค้านี้ใน A-CRM — เลือกจากรายชื่อ'); return; }
       if (!confirm(`ยังไม่มีลูกค้า "${name}" — เพิ่มเป็นลูกค้าใหม่?`)) return;
       cust = db.save('customers', { name });
     }
     const list = readItems();
     if (!list.length) { toast('กรุณาใส่สินค้าอย่างน้อย 1 รายการ'); return; }
     const rec = db.save('orders', {
-      ...(r.id !== 'new' && { id: r.id }),
+      id: r.id === 'new' ? viewState.newId : r.id,
+      kind: 'order',
       no: form.no.value.trim(),
       date: form.date.value,
       customerId: cust.id,
@@ -476,7 +619,7 @@ function bindOrderForm(r) {
       note: form.note.value.trim(),
     });
     toast('บันทึกออเดอร์แล้ว');
-    go(`#/order/${rec.id}`);
+    go(link('order', rec.id));
   });
 }
 
@@ -569,8 +712,10 @@ function updateSyncBadge(st = syncState()) {
 
 async function boot() {
   await db.init();
+  await startAutoSync();
   render();
   db.onChange((source) => {
+    dataVersion += 1;
     if (source === 'local') scheduleSync();
     updateSyncBadge();
     // Re-render views that show data, but never clobber a form being edited.
@@ -580,10 +725,18 @@ async function boot() {
     if (['customers', 'orders'].includes(r.name)) (r.name === 'customers' ? renderCustomerResults : renderOrderResults)();
     else render();
   });
-  onSync(updateSyncBadge);
+  let backend = syncState().backend;
+  onSync((st) => {
+    updateSyncBadge(st);
+    // The backend type decides how sales are counted; recompute when it changes.
+    if (st.backend !== backend) {
+      backend = st.backend;
+      dataVersion += 1;
+      if (!main.querySelector('form.form')) render();
+    }
+  });
   $('#sync').addEventListener('click', () => { sync(); toast('กำลังซิงค์…'); });
   updateSyncBadge();
-  startAutoSync();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 

@@ -1,8 +1,8 @@
 // Two-way sync with the server: push local changes, pull everything newer than our cursor.
-import { mem, STORES, getMeta, setMeta, putMany, mergeRecords } from './db.js';
+import { mem, STORES, getMeta, setMeta, putMany, mergeRecords, applySnapshot } from './db.js';
 
 let running = null;
-const state = { status: 'idle', error: '', lastSyncAt: 0 };
+const state = { status: 'idle', error: '', lastSyncAt: 0, backend: '', readOnly: false, rejected: 0 };
 const subs = new Set();
 export const syncState = () => state;
 export function onSync(fn) { subs.add(fn); }
@@ -69,27 +69,47 @@ async function doSync({ periodic = false } = {}) {
     for (const s of STORES) {
       changes[s] = [...mem[s].values()].filter((r) => r._dirty).map(({ _dirty, ...r }) => r);
     }
-    const data = await callServer('sync', { since, changes });
+    const data = await callServer('sync', { since, changes, user: (await getMeta('user')) || '' });
 
-    // Clear the dirty flag only for records not edited again while the request was in flight.
+    // Clear the dirty flag only for records the server took (all of them unless it says
+    // otherwise) and that were not edited again while the request was in flight.
     for (const s of STORES) {
+      const took = Array.isArray(data.accepted?.[s]) ? new Set(data.accepted[s]) : null;
       const cleared = [];
       for (const r of changes[s]) {
         const cur = mem[s].get(r.id);
-        if (cur && cur._dirty && cur.updatedAt === r.updatedAt) cleared.push({ ...cur, _dirty: 0 });
+        if ((!took || took.has(r.id)) && cur && cur._dirty && cur.updatedAt === r.updatedAt) cleared.push({ ...cur, _dirty: 0 });
       }
       await putMany(s, cleared, 'sync');
     }
-    await mergeRecords(data.changes || {}, { source: 'sync' });
+    if (data.snapshot) await applySnapshot(expandItems(data.changes || {}, data.dict));
+    else if (!data.unchanged) await mergeRecords(data.changes || {}, { source: 'sync' });
+    const backend = data.backend || '';
+    const rejected = STORES.reduce((n, s) => n + (data.rejected?.[s]?.length || 0), 0);
+    await setMeta('backend', backend);
     await setMeta('cursor', data.cursor);
     const now = Date.now();
     await setMeta('lastSyncAt', now);
-    set({ status: 'ok', lastSyncAt: now });
+    set({ status: 'ok', lastSyncAt: now, backend, readOnly: !!data.readOnly, rejected });
     return true;
   } catch (e) {
     set({ status: 'error', error: e.message });
     return false;
   }
+}
+
+// A-CRM sends items as [code, qty, price, name?, unit?] with names/units from a product dictionary.
+function expandItems(changes, dict = {}) {
+  for (const o of changes.orders || []) {
+    if (!Array.isArray(o.items)) continue;
+    o.items = o.items.map((i) => {
+      if (!Array.isArray(i)) return i;
+      const [code, qty, price, name, unit] = i;
+      const d = dict[code] || [];
+      return { code, name: name ?? d[0] ?? code, qty, price, unit: unit ?? d[1] ?? '' };
+    });
+  }
+  return changes;
 }
 
 let debounce;
@@ -100,6 +120,7 @@ export function scheduleSync(delay = 2000) {
 
 export async function startAutoSync() {
   state.lastSyncAt = (await getMeta('lastSyncAt')) || 0;
+  state.backend = (await getMeta('backend')) || '';
   window.addEventListener('online', () => scheduleSync(500));
   window.addEventListener('offline', () => set({ status: 'offline' }));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(300); });

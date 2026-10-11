@@ -127,3 +127,12 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brand); out
   background: #17202a; color: #fff; padding: .6rem 1rem; border-radius: 10px; font-size: .9rem; pointer-events: none;
   transition: .2s; z-index: 10; max-width: calc(100% - 32px); }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+.src { font-size: .75rem; color: var(--muted); background: var(--line); padding: 2px 8px; border-radius: 999px; }
+.plain { list-style: none; margin: 0; padding: 0; }
+.plain li { padding: .45rem 0; border-top: 1px solid var(--line); }
+.plain li:first-child { border-top: 0; padding-top: 0; }
+.plain span, .plain small { display: block; }
+.plain small { color: var(--muted); font-size: .8rem; }
+.hint code, .sync-status code { font-size: .8em; }
+.actions + .actions { margin-top: -4px; }
+.btn.wide + .card, .card + .btn.wide { margin-top: 0; }

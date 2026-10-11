@@ -77,6 +77,36 @@ export async function setMeta(key, value) {
   return done(tx);
 }
 
+export function deleteMany(store, ids, source = 'sync') {
+  if (!ids.length) return Promise.resolve();
+  for (const id of ids) mem[store].delete(id);
+  const tx = idb.transaction(store, 'readwrite');
+  const os = tx.objectStore(store);
+  for (const id of ids) os.delete(id);
+  emit(source);
+  return done(tx);
+}
+
+// Replace server-owned records (src set) with a full snapshot. Local unsynced edits are kept.
+export async function applySnapshot(data) {
+  for (const s of STORES) {
+    const incoming = data[s] || [];
+    const ids = new Set(incoming.map((r) => r.id));
+    const remove = [];
+    for (const r of mem[s].values()) if (r.src && !r._dirty && !ids.has(r.id)) remove.push(r.id);
+    const put = [];
+    for (const r of incoming) {
+      const cur = mem[s].get(r.id);
+      if (cur && cur._dirty) continue;
+      const rec = { ...r, _dirty: 0 };
+      if (cur && JSON.stringify(cur) === JSON.stringify(rec)) continue;
+      put.push(rec);
+    }
+    await deleteMany(s, remove);
+    await putMany(s, put, 'sync');
+  }
+}
+
 // Merge records from a backup or the server: newest updatedAt wins.
 export async function mergeRecords(data, { markDirty = false, source = 'merge' } = {}) {
   let count = 0;

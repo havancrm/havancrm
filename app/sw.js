@@ -1,5 +1,5 @@
 // App-shell cache: the app opens instantly and works fully offline.
-const CACHE = 'havancrm-v2';
+const CACHE = 'havancrm-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'sync.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (e) => {

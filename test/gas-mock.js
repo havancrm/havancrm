@@ -30,6 +30,7 @@ export class Sheet {
   getName() { return this.name; }
   cell(r, c) { const v = this.data[r - 1]?.[c - 1]; return v === undefined ? '' : v; }
   set(r, c, v) { (this.data[r - 1] ||= [])[c - 1] = v; }
+  getLastColumn() { return Math.max(0, ...this.data.map((r) => (r || []).length)); }
   getLastRow() {
     for (let r = this.data.length; r > 0; r--) if ((this.data[r - 1] || []).some((v) => v !== '' && v !== undefined)) return r;
     return 0;
@@ -44,8 +45,10 @@ export class Sheet {
   hideColumns() {}
 }
 
-export function loadCodeGs() {
-  const sheets = new Map();
+// Builds a sandbox with the Apps Script globals Code.gs files use, then runs the given file in it.
+const HOUR_AGO = Date.now() - 3600000;
+
+export function loadGas(file, { sheets = new Map(), lastUpdated = () => HOUR_AGO } = {}) {
   const ss = {
     getSheetByName: (n) => sheets.get(n) || null,
     insertSheet: (n) => { const s = new Sheet(n); sheets.set(n, s); return s; },
@@ -54,10 +57,19 @@ export function loadCodeGs() {
     getName: () => 'HavanCRM',
     getId: () => 'sheet-id',
   };
+  const props = new Map();
+  const drive = { copies: [] };
   let uuid = 0;
   const ctx = vm.createContext({
-    SpreadsheetApp: { getActive: () => ss },
+    SpreadsheetApp: { getActive: () => ss, openById: () => ss, flush() {} },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() {} }) },
+    PropertiesService: {
+      getScriptProperties: () => ({ getProperty: (k) => props.get(k) ?? null, setProperty: (k, v) => props.set(k, String(v)) }),
+    },
+    DriveApp: {
+      getFileById: () => ({ getLastUpdated: () => new Date(lastUpdated()), makeCopy: (name) => drive.copies.push(name) }),
+      getFolderById: () => ({}),
+    },
     ContentService: {
       MimeType: { JSON: 'json' },
       createTextOutput: (text) => ({ text, setMimeType() { return this; } }),
@@ -69,8 +81,10 @@ export function loadCodeGs() {
     Logger: { log() {} },
     console,
   });
-  vm.runInContext(fs.readFileSync(new URL('../google-apps-script/Code.gs', import.meta.url), 'utf8'), ctx);
+  vm.runInContext(fs.readFileSync(new URL(file, import.meta.url), 'utf8'), ctx);
   const token = vm.runInContext('SYNC_TOKEN', ctx);
   const post = (body) => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify({ token, ...body }) } }).text);
-  return { ctx, ss, sheets, post, token };
+  return { ctx, ss, sheets, post, token, props, drive };
 }
+
+export const loadCodeGs = () => loadGas('../google-apps-script/Code.gs');
