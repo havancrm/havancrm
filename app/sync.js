@@ -1,6 +1,7 @@
 // Two-way sync with the server: push local changes, pull everything newer than our cursor.
 import { mem, STORES, getMeta, setMeta, putMany, mergeRecords, applySnapshot } from './db.js';
 
+const FULL_SYNC_MS = 24 * 3600000;
 let running = null;
 const state = { status: 'idle', error: '', lastSyncAt: 0, backend: '', readOnly: false, rejected: 0 };
 const subs = new Set();
@@ -64,12 +65,14 @@ async function doSync({ periodic = false } = {}) {
   if (periodic && isAppsScript(url) && !pendingCount() && Date.now() - state.lastSyncAt < 180000) return true;
   set({ status: 'syncing', error: '' });
   try {
-    const since = (await getMeta('cursor')) || 0;
+    const cursor = (await getMeta('cursor')) || 0;
+    // Deleted rows never show up in an incremental sync, so the whole sheet is read once a day.
+    const full = !cursor || Date.now() - ((await getMeta('fullAt')) || 0) > FULL_SYNC_MS;
     const changes = {};
     for (const s of STORES) {
       changes[s] = [...mem[s].values()].filter((r) => r._dirty).map(({ _dirty, ...r }) => r);
     }
-    const data = await callServer('sync', { since, changes, user: (await getMeta('user')) || '' });
+    const data = await callServer('sync', { since: full ? 0 : cursor, changes, user: (await getMeta('user')) || '' });
 
     // Clear the dirty flag only for records the server took (all of them unless it says
     // otherwise) and that were not edited again while the request was in flight.
@@ -82,8 +85,13 @@ async function doSync({ periodic = false } = {}) {
       }
       await putMany(s, cleared, 'sync');
     }
-    if (data.snapshot) await applySnapshot(expandItems(data.changes || {}, data.dict));
-    else if (!data.unchanged) await mergeRecords(data.changes || {}, { source: 'sync' });
+    const incoming = expandItems(data.changes || {}, data.dict);
+    if (data.snapshot) {
+      await applySnapshot(incoming);
+      await setMeta('fullAt', Date.now());
+    } else {
+      await mergeRecords(incoming, { source: 'sync' });
+    }
     const backend = data.backend || '';
     const rejected = STORES.reduce((n, s) => n + (data.rejected?.[s]?.length || 0), 0);
     await setMeta('backend', backend);

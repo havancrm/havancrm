@@ -109,12 +109,24 @@ for (const shuffle of [false, true]) {
   });
 }
 
-test('unchanged spreadsheet returns no data', () => {
-  const { post } = fixture();
+test('incremental sync sends only rows changed since the cursor', () => {
+  const { post, sheets } = fixture();
   const first = post({ since: 0, changes: {} });
+  assert.ok(first.cursor > 0 && first.cursor <= Date.now());
+
   const again = post({ since: first.cursor, changes: {} });
-  assert.equal(again.unchanged, true);
-  assert.equal(again.changes, undefined);
+  assert.equal(again.snapshot, false);
+  assert.deepEqual(again.changes.customers.map((c) => c.id), [], 'untouched customers are not resent');
+  assert.deepEqual(again.changes.orders.map((o) => o.id), ['O-691001-083112hl'], 'only the newest order is inside the overlap window; bills without a timestamp are not resent');
+  assert.ok(again.dict['2002'], 'product names are always included');
+
+  const cs = sheets.get('CUSTOMERS');
+  const h = cs.data[0];
+  const row = cs.data.find((r) => r[h.indexOf('customer_code')] === '10002');
+  row[h.indexOf('shop_name')] = 'แก้ชื่อใหม่';
+  row[h.indexOf('updated_at')] = new Date();
+  const later = post({ since: first.cursor, changes: {} });
+  assert.deepEqual(later.changes.customers.map((c) => [c.id, c.name]), [['10002', 'แก้ชื่อใหม่']]);
 });
 
 test('read-only by default: orders and customer edits are rejected, sheets untouched', () => {

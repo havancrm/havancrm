@@ -77,16 +77,11 @@ function sync_(body) {
     }
   }
 
-  // The file's last-modified time is the data version: unchanged → skip reading the sheets.
-  const version = DriveApp.getFileById(SPREADSHEET_ID).getLastUpdated().getTime();
-  result.cursor = version;
-  const settled = Date.now() - version > 60000; // Drive can lag right after an edit
-  if (Number(body.since) === version && settled && !result.accepted.orders.length) {
-    result.unchanged = true;
-    return result;
-  }
-  const snap = snapshot_(ss, tz);
-  result.snapshot = true;
+  // since = 0 asks for everything (first sync, daily full sync); otherwise only rows changed since then.
+  const since = Math.max(0, Number(body.since) || 0);
+  const snap = snapshot_(ss, tz, since);
+  result.snapshot = since === 0;
+  result.cursor = snap.cursor;
   result.dict = snap.dict;
   result.changes = snap.changes;
   return result;
@@ -107,8 +102,19 @@ function getter_(table) {
   return (row, name) => (name in table.col ? row[table.col[name]] : '');
 }
 
-function snapshot_(ss, tz) {
+// Rows changed within this window before the cursor are sent again: a late write in the sheet can
+// carry an updated_at slightly older than the newest row the phone already has.
+const OVERLAP_MS = 10 * 60000;
+
+// Only rows changed since `since` are returned (with their bill/order items). `cursor` is the newest
+// updated_at seen in the sheet, capped at now, and becomes the next `since`.
+function snapshot_(ss, tz, since) {
+  const from = since - OVERLAP_MS;
+  let newest = 0;
+  const fresh = (ts) => { if (ts > newest) newest = ts; return ts >= from; };
+
   // Products: code → [name, unit]; bill/order items reference it to keep the payload small.
+  // Always sent in full: the product list is small.
   const pr = readTable_(ss, 'PRODUCTS');
   const pg = getter_(pr);
   const dict = {};
@@ -130,6 +136,8 @@ function snapshot_(ss, tz) {
   cu.rows.forEach((row) => {
     const code = str_(cg(row, 'customer_code'));
     if (!code) return;
+    const updatedAt = ms_(cg(row, 'updated_at'), tz) || ms_(cg(row, 'field_updated_at'), tz) || ms_(cg(row, 'last_synced_at'), tz);
+    if (!fresh(updatedAt)) return;
     const phones = phones_(cg(row, 'phone_all'), cg(row, 'primary_phone'));
     customers.push(compact_({
       id: code,
@@ -150,17 +158,19 @@ function snapshot_(ss, tz) {
       tags: str_(cg(row, 'tags')),
       note: str_(cg(row, 'customer_note')) || str_(cg(row, 'note')),
       inactive: isFalse_(cg(row, 'active_flag')) || undefined,
-      updatedAt: ms_(cg(row, 'updated_at'), tz),
+      updatedAt: updatedAt,
     }));
   });
 
-  // Bills (sales history)
+  // Bills (sales history). A bill is sent when its header or one of its items changed.
   const bi = readTable_(ss, 'BILL_ITEMS');
   const big = getter_(bi);
   const billItems = {};
+  const billItemFresh = new Set();
   bi.rows.forEach((row) => {
     const inv = str_(big(row, 'invoice_no'));
     if (!inv) return;
+    if (fresh(ms_(big(row, 'updated_at'), tz))) billItemFresh.add(inv);
     if (!billItems[inv]) billItems[inv] = [];
     billItems[inv].push([num_(big(row, 'line_no')) || 0, item(
       str_(big(row, 'product_code')),
@@ -177,6 +187,9 @@ function snapshot_(ss, tz) {
   bl.rows.forEach((row) => {
     const inv = str_(bg(row, 'invoice_no'));
     if (!inv) return;
+    const updatedAt = ms_(bg(row, 'updated_at'), tz) || ms_(bg(row, 'created_at'), tz);
+    const headerFresh = fresh(updatedAt);
+    if (!headerFresh && !billItemFresh.has(inv)) return;
     const total = num_(bg(row, 'final_total'));
     orders.push(compact_({
       id: 'B' + inv,
@@ -191,7 +204,7 @@ function snapshot_(ss, tz) {
       salesperson: str_(bg(row, 'salesperson')) || str_(bg(row, 'sales_user')),
       opener: str_(bg(row, 'bill_opener')),
       terms: str_(bg(row, 'payment_terms_snapshot')),
-      updatedAt: ms_(bg(row, 'updated_at'), tz),
+      updatedAt: updatedAt,
     }));
   });
 
@@ -199,9 +212,13 @@ function snapshot_(ss, tz) {
   const oi = readTable_(ss, 'ORDER_ITEMS');
   const oig = getter_(oi);
   const orderItems = {};
+  const orderItemFresh = new Set();
   oi.rows.forEach((row) => {
     const oid = str_(oig(row, 'order_id'));
-    if (!oid || isFalse_(oig(row, 'active_flag'))) return;
+    if (!oid) return;
+    // A removed item still changes its order, so it counts as fresh too.
+    if (fresh(ms_(oig(row, 'updated_at'), tz) || ms_(oig(row, 'created_at'), tz))) orderItemFresh.add(oid);
+    if (isFalse_(oig(row, 'active_flag'))) return;
     if (!orderItems[oid]) orderItems[oid] = [];
     orderItems[oid].push([num_(oig(row, 'line_no')) || 0, item(
       str_(oig(row, 'product_code')),
@@ -216,6 +233,8 @@ function snapshot_(ss, tz) {
   od.rows.forEach((row) => {
     const oid = str_(og(row, 'order_id')) || str_(og(row, 'id'));
     if (!oid || /TEST/i.test(oid)) return;
+    const updatedAt = ms_(og(row, 'updated_at'), tz) || ms_(og(row, 'created_at'), tz) || ms_(og(row, 'order_date'), tz);
+    if (!fresh(updatedAt) && !orderItemFresh.has(oid)) return;
     let items = (orderItems[oid] || []).sort(byLine).map((x) => x[1]);
     if (!items.length) items = legacyItems_(og(row, 'items'), item, dict);
     const total = num_(og(row, 'final_total'));
@@ -234,11 +253,11 @@ function snapshot_(ss, tz) {
       status: orderStatus_(og(row, 'status')),
       note: str_(og(row, 'note')),
       salesperson: str_(og(row, 'sales_user')),
-      updatedAt: ms_(og(row, 'updated_at'), tz),
+      updatedAt: updatedAt,
     }));
   });
 
-  return { dict: dict, changes: { customers: customers, orders: orders } };
+  return { dict: dict, changes: { customers: customers, orders: orders }, cursor: Math.min(newest, Date.now()) };
 }
 
 // Legacy ORDERS.items JSON: [{sku, q, u, p?, g?}] — a missing p means the price is unknown;
