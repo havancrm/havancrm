@@ -172,7 +172,8 @@ export function captureGps() {
 }
 
 // Shrink a photo before storing it in the record so sync payloads stay small.
-export function readPhoto(file, max = 640) {
+// 320px at quality 0.6 keeps a photo near 20-30 KB, so it fits one Google Sheets cell.
+export function readPhoto(file, max = 320) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -183,7 +184,7 @@ export function readPhoto(file, max = 640) {
       c.height = Math.round(img.height * scale);
       c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
       URL.revokeObjectURL(url);
-      resolve(c.toDataURL('image/jpeg', 0.7));
+      resolve(c.toDataURL('image/jpeg', 0.6));
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('อ่านรูปไม่สำเร็จ')); };
     img.src = url;
