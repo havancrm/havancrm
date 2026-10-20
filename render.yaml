@@ -1,0 +1,17 @@
+# Render Blueprint: one web service with a persistent disk for the database and backups.
+# HTTPS is provided by Render. Set SYNC_TOKEN in the Render dashboard when prompted.
+services:
+  - type: web
+    name: art-crm
+    runtime: docker
+    branch: claude/art-crm-mobile-sales-b6yzpb
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: SYNC_TOKEN
+        sync: false
+    disk:
+      name: art-crm-data
+      mountPath: /data
+      sizeGB: 1

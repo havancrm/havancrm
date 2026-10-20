@@ -1,0 +1,7 @@
+node_modules
+server/data
+.git
+test
+docs
+google-apps-script
+*.md
