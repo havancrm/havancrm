@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0f766e">
+  <meta name="theme-color" content="#1e3a5f">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <title>HavanCRM</title>
+  <title>ART CRM</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon.svg">
@@ -14,18 +14,19 @@
 </head>
 <body>
   <header class="topbar">
-    <span class="brand">HavanCRM</span>
+    <span class="brand">ART CRM</span>
     <span class="perf" id="perf" title="เวลาประมวลผลหน้าจอ"></span>
-    <button class="sync" id="sync" type="button">●</button>
+    <button class="status" id="status" type="button" data-act="status" data-status="ok"><i class="dot" aria-hidden="true"></i><span>พร้อมใช้</span></button>
   </header>
-  <main id="main"><p class="empty">กำลังโหลด…</p></main>
-  <nav class="tabbar">
-    <a href="#/" data-tab=""><span>📊</span>ยอดขาย</a>
-    <a href="#/customers" data-tab="customers"><span>👥</span>ลูกค้า</a>
-    <a href="#/orders" data-tab="orders"><span>🧾</span>ออเดอร์</a>
-    <a href="#/settings" data-tab="settings"><span>⚙️</span>ตั้งค่า</a>
+  <main id="main"><p class="empty">กำลังเปิดข้อมูลในเครื่อง…</p></main>
+  <nav class="tabbar" aria-label="เมนูหลัก">
+    <a href="#/" data-tab="home" data-icon="home"><span>หน้าหลัก</span></a>
+    <a href="#/customers" data-tab="customers" data-icon="users"><span>ลูกค้า</span></a>
+    <a href="#/orders" data-tab="orders" data-icon="cart" class="center"><span>รับออเดอร์</span></a>
+    <a href="#/tasks" data-tab="tasks" data-icon="check"><span>งาน</span></a>
+    <a href="#/backstage" data-tab="menu" data-icon="menu"><span>หลังบ้าน</span></a>
   </nav>
-  <div class="toast" id="toast" role="status"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script type="module" src="app.js"></script>
 </body>
 </html>

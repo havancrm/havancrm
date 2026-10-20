@@ -1,11 +1,11 @@
 {
-  "name": "HavanCRM ผู้ช่วยเซลล์",
-  "short_name": "HavanCRM",
+  "name": "ART CRM",
+  "short_name": "ART CRM",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f4f6f8",
-  "theme_color": "#0f766e",
+  "theme_color": "#1e3a5f",
   "lang": "th",
   "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
 }

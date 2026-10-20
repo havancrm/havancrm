@@ -1,6 +1,10 @@
 // App-shell cache: the app opens instantly and works fully offline.
-const CACHE = 'havancrm-v3';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'sync.js', 'manifest.webmanifest', 'icon.svg'];
+const CACHE = 'artcrm-v1';
+const SHELL = [
+  './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icon.svg',
+  'app.js', 'core.js', 'db.js', 'sync.js', 'ui.js', 'derived.js',
+  'views/home.js', 'views/customers.js', 'views/orders.js', 'views/work.js', 'views/backstage.js',
+];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

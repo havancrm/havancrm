@@ -4,7 +4,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { FileStore, applyChanges, changesSince } from './store.js';
+import { FileStore, COLLECTIONS, applyChanges, changesSince } from './store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP_DIR = path.join(here, '..', 'app');
@@ -54,9 +54,17 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === '/api/sync' && req.method === 'POST') {
     const { since = 0, changes = {} } = JSON.parse((await readBody(req)) || '{}');
-    const accepted = applyChanges(store.state, changes);
+    const result = {};
+    const accepted = applyChanges(store.state, changes, result);
     if (accepted) await store.save();
-    return send(res, 200, { cursor: store.state.seq, accepted, changes: changesSince(store.state, since) });
+    return send(res, 200, {
+      cursor: store.state.seq,
+      accepted,
+      acceptedIds: result.acceptedIds,
+      conflicts: result.conflicts,
+      supports: COLLECTIONS,
+      changes: changesSince(store.state, since),
+    });
   }
   if (url.pathname === '/api/backup' && req.method === 'POST') {
     const file = await store.backup();
@@ -94,5 +102,5 @@ store.backup().catch(() => {});
 setInterval(() => store.backup().catch(() => {}), 6 * 60 * 60 * 1000).unref();
 
 server.listen(PORT, () => {
-  console.log(`HavanCRM server: http://localhost:${PORT}${TOKEN ? ' (token required)' : ''}`);
+  console.log(`ART CRM server: http://localhost:${PORT}${TOKEN ? ' (token required)' : ''}`);
 });
