@@ -50,6 +50,8 @@ function readBody(req, limit = 20 * 1024 * 1024) {
 }
 
 async function handleApi(req, res, url) {
+  // Health is open so platform health checks work without the sync token (it reveals no data).
+  if (url.pathname === '/api/health') return send(res, 200, { ok: true, seq: store.state.seq });
   if (!authorized(req)) return send(res, 401, { error: 'unauthorized' });
 
   if (url.pathname === '/api/sync' && req.method === 'POST') {
